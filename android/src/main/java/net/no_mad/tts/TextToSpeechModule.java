@@ -1,15 +1,19 @@
 package net.no_mad.tts;
 
+import android.media.AudioAttributes;
+import android.media.AudioFocusRequest;
 import android.media.AudioManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.content.Intent;
 import android.content.ActivityNotFoundException;
-import android.app.Activity;
 import android.net.Uri;
 import android.speech.tts.TextToSpeech;
 import android.speech.tts.UtteranceProgressListener;
 import android.speech.tts.Voice;
+
+import androidx.annotation.RequiresApi;
+
 import com.facebook.react.bridge.*;
 import com.facebook.react.modules.core.DeviceEventManagerModule;
 
@@ -18,18 +22,109 @@ import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
 
-public class TextToSpeechModule extends ReactContextBaseJavaModule {
+public class TextToSpeechModule extends ReactContextBaseJavaModule{
 
     private TextToSpeech tts;
     private Boolean ready = null;
     private ArrayList<Promise> initStatusPromises;
 
+    @RequiresApi(26)
+    private AudioFocusRequest focus = null;
+    private boolean hasAudioFocus = false;
+
     private boolean ducking = false;
     private AudioManager audioManager;
-    private AudioManager.OnAudioFocusChangeListener afChangeListener;
+
+    private AudioManager.OnAudioFocusChangeListener afChangeListener = new AudioManager.OnAudioFocusChangeListener() {
+
+        @Override
+        public void onAudioFocusChange(int focusChange) {
+            switch(focusChange) {
+                case AudioManager.AUDIOFOCUS_LOSS:
+                    stop();
+                    break;
+                case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT:
+                    stop();
+                    break;
+                case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK:
+                    break;
+                case AudioManager.AUDIOFOCUS_GAIN:
+                    break;
+            }
+        }
+    };
 
     private Map<String, Locale> localeCountryMap;
     private Map<String, Locale> localeLanguageMap;
+    private void initCountryLanguageCodeMapping() {
+        String[] countries = Locale.getISOCountries();
+        localeCountryMap = new HashMap<String, Locale>(countries.length);
+        for (String country : countries) {
+            Locale locale = new Locale("", country);
+            localeCountryMap.put(locale.getISO3Country().toUpperCase(), locale);
+        }
+        String[] languages = Locale.getISOLanguages();
+        localeLanguageMap = new HashMap<String, Locale>(languages.length);
+        for (String language : languages) {
+            Locale locale = new Locale(language);
+            localeLanguageMap.put(locale.getISO3Language(), locale);
+        }
+    }
+
+    private String iso3CountryCodeToIso2CountryCode(String iso3CountryCode) {
+        return localeCountryMap.get(iso3CountryCode).getCountry();
+    }
+
+    private String iso3LanguageCodeToIso2LanguageCode(String iso3LanguageCode) {
+        return localeLanguageMap.get(iso3LanguageCode).getLanguage();
+    }
+
+    private void requestFocus() {
+        if(hasAudioFocus) return;
+
+        int r;
+
+        if(audioManager == null) {
+            r = AudioManager.AUDIOFOCUS_REQUEST_FAILED;
+        } else if(Build.VERSION.SDK_INT >= 26) {
+            focus = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                    .setOnAudioFocusChangeListener(afChangeListener)
+                    .setAudioAttributes(new AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                            .build())
+                    .build();
+
+            r = audioManager.requestAudioFocus(focus);
+        } else {
+            //noinspection deprecation
+            r = audioManager.requestAudioFocus(afChangeListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN);
+        }
+
+        hasAudioFocus = r == AudioManager.AUDIOFOCUS_REQUEST_GRANTED;
+    }
+
+    private void abandonFocus() {
+        if(!hasAudioFocus) return;
+
+        int r;
+
+        if(audioManager == null) {
+            r = AudioManager.AUDIOFOCUS_REQUEST_FAILED;
+        } else if(Build.VERSION.SDK_INT >= 26) {
+            r = audioManager.abandonAudioFocusRequest(focus);
+        } else {
+            //noinspection deprecation
+            r = audioManager.abandonAudioFocus(afChangeListener);
+        }
+
+        hasAudioFocus = r != AudioManager.AUDIOFOCUS_REQUEST_GRANTED;
+    }
+
+    private void stop() {
+        tts.stop();
+        abandonFocus();
+    }
 
     public TextToSpeechModule(ReactApplicationContext reactContext) {
         super(reactContext);
@@ -81,29 +176,6 @@ public class TextToSpeechModule extends ReactContextBaseJavaModule {
                 sendEvent("tts-cancel", utteranceId);
             }
         });
-    }
-
-    private void initCountryLanguageCodeMapping() {
-        String[] countries = Locale.getISOCountries();
-        localeCountryMap = new HashMap<String, Locale>(countries.length);
-        for (String country: countries) {
-            Locale locale = new Locale("", country);
-            localeCountryMap.put(locale.getISO3Country().toUpperCase(), locale);
-        }
-        String[] languages = Locale.getISOLanguages();
-        localeLanguageMap = new HashMap<String, Locale>(languages.length);
-        for (String language: languages) {
-            Locale locale = new Locale(language);
-            localeLanguageMap.put(locale.getISO3Language(), locale);
-        }
-    }
-
-    private String iso3CountryCodeToIso2CountryCode(String iso3CountryCode) {
-        return localeCountryMap.get(iso3CountryCode).getCountry();
-    }
-
-    private String iso3LanguageCodeToIso2LanguageCode(String iso3LanguageCode) {
-        return localeLanguageMap.get(iso3LanguageCode).getLanguage();
     }
 
     private void resolveReadyPromise(Promise promise) {
@@ -181,16 +253,7 @@ public class TextToSpeechModule extends ReactContextBaseJavaModule {
 
         if(ducking) {
             // Request audio focus for playback
-            int amResult = audioManager.requestAudioFocus(afChangeListener,
-                                                          // Use the music stream.
-                                                          AudioManager.STREAM_MUSIC,
-                                                          // Request permanent focus.
-                                                          AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK);
-
-            if(amResult != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
-                promise.reject("Android AudioManager error, failed to request audio focus");
-                return;
-            }
+            requestFocus();
         }
 
         String utteranceId = Integer.toString(utterance.hashCode());
@@ -292,13 +355,16 @@ public class TextToSpeechModule extends ReactContextBaseJavaModule {
                     voiceMap.putString("id", voice.getName());
                     voiceMap.putString("name", voice.getName());
 
-                    String language = iso3LanguageCodeToIso2LanguageCode(voice.getLocale().getISO3Language());
+                    String language = voice.getLocale().getISO3Language();
                     String country = voice.getLocale().getISO3Country();
-                    if(country != "") {
-                        language += "-" + iso3CountryCodeToIso2CountryCode(country);
+                    String language_Country = iso3LanguageCodeToIso2LanguageCode(language);
+                    if(country != "")
+                    {
+                        language_Country+="-"+iso3CountryCodeToIso2CountryCode(country);
                     }
 
-                    voiceMap.putString("language", language);
+                    voiceMap.putString("language", language_Country);
+
                     voiceMap.putInt("quality", voice.getQuality());
                     voiceMap.putInt("latency", voice.getLatency());
                     voiceMap.putBoolean("networkConnectionRequired", voice.isNetworkConnectionRequired());
@@ -319,6 +385,7 @@ public class TextToSpeechModule extends ReactContextBaseJavaModule {
         if(notReady(promise)) return;
 
         int result = tts.stop();
+        abandonFocus();
         resolvePromiseWithStatusCode(result, promise);
     }
 
